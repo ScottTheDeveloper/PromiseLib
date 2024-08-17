@@ -1,4 +1,4 @@
--- @scotts Promise System
+-- @scott's Promise System
 
 local Promise = {}
 Promise.__index = Promise
@@ -12,34 +12,40 @@ local function createPromise(executor)
     self._progressCallbacks = {}
     self._cancellationToken = nil
 
+    -- Handles the resolution of the promise
     local function resolve(value)
-        if self._status == "Pending" then
-            self._status = "Fulfilled"
-            self._value = value
-            for _, callback in ipairs(self._callbacks) do
-                callback()
-            end
+        if self._status ~= "Pending" then return end
+        self._status = "Fulfilled"
+        self._value = value
+        for _, callback in ipairs(self._callbacks) do
+            callback()
         end
     end
 
+    -- Handles the rejection of the promise
     local function reject(reason)
-        if self._status == "Pending" then
-            self._status = "Rejected"
-            self._value = reason
-            for _, callback in ipairs(self._callbacks) do
-                callback()
-            end
+        if self._status ~= "Pending" then return end
+        self._status = "Rejected"
+        self._value = reason
+        for _, callback in ipairs(self._callbacks) do
+            callback()
         end
     end
 
+    -- Handles progress notifications
     local function notifyProgress(progress)
         for _, progressCallback in ipairs(self._progressCallbacks) do
-            progressCallback(progress)
+            pcall(progressCallback, progress, self._value)
         end
     end
 
-    -- Execute the provided executor function
-    executor(resolve, reject, notifyProgress)
+    -- Safely execute the provided executor function
+    local success, err = pcall(function()
+        executor(resolve, reject, notifyProgress)
+    end)
+    if not success then
+        reject(err)
+    end
 
     return self
 end
@@ -51,6 +57,13 @@ end
 
 -- Adds callbacks for when the promise is fulfilled or rejected
 function Promise:Then(onFulfilled, onRejected, onProgress)
+    -- If already resolved or rejected, handle it immediately
+    if self._status == "Fulfilled" and onFulfilled then
+        return Promise.Resolve(onFulfilled(self._value))
+    elseif self._status == "Rejected" and onRejected then
+        return Promise.Reject(onRejected(self._value))
+    end
+    
     local newPromise = Promise.new(function(resolve, reject, notifyProgress)
         local function callback()
             if self._status == "Fulfilled" then
@@ -137,8 +150,10 @@ end
 
 -- Cancels the promise if a cancellation token is provided
 function Promise:Cancel()
+    if self._status ~= "Pending" then return end
     if self._cancellationToken then
         self._cancellationToken()
+        self._status = "Cancelled"
     end
 end
 
@@ -222,3 +237,5 @@ function Promise:Delay(ms)
         end)
     end)
 end
+
+return Promise
