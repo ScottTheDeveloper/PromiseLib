@@ -1,224 +1,260 @@
--- @scott's Promise System
+-- @scott
 
 local Promise = {}
 Promise.__index = Promise
 
--- Utility function to create a new promise
+local function isPromise(obj)
+    return type(obj) == "table" and getmetatable(obj) == Promise
+end
+
+local function asyncCall(fn, ...)
+    local args = table.pack(...)
+    task.defer(function()
+        fn(table.unpack(args, 1, args.n))
+    end)
+end
+
+local function safePcall(fn, ...)
+    return pcall(fn, ...)
+end
+
 local function createPromise(executor)
     local self = setmetatable({}, Promise)
     self._status = "Pending"
     self._value = nil
     self._callbacks = {}
     self._progressCallbacks = {}
-    self._cancellationToken = nil
+    self._cancellationCallback = nil
+    self._finalized = false
 
-    -- Handles the resolution of the promise
+    local function drainCallbacks()
+        if self._finalized then return end
+        self._finalized = true
+        task.defer(function()
+            for _, cb in ipairs(self._callbacks) do
+                safePcall(cb)
+            end
+            self._callbacks = {}
+            self._progressCallbacks = {}
+        end)
+    end
+
     local function resolve(value)
         if self._status ~= "Pending" then return end
+        if isPromise(value) then
+            value:Then(function(v)
+                resolve(v)
+            end, function(r)
+                reject(r)
+            end, function(p, cur)
+                notifyProgress(p, cur)
+            end)
+            return
+        end
         self._status = "Fulfilled"
         self._value = value
-        for _, callback in ipairs(self._callbacks) do
-            callback()
-        end
+        drainCallbacks()
     end
 
-    -- Handles the rejection of the promise
-    local function reject(reason)
+    function reject(reason)
         if self._status ~= "Pending" then return end
         self._status = "Rejected"
-        self._value = reason
-        for _, callback in ipairs(self._callbacks) do
-            callback()
+        if type(reason) == "string" then
+            self._value = debug.traceback(reason, 2)
+        else
+            self._value = reason
+        end
+        drainCallbacks()
+    end
+
+    function notifyProgress(progress, current)
+        for _, cb in ipairs(self._progressCallbacks) do
+            safePcall(cb, progress, current)
         end
     end
 
-    -- Handles progress notifications
-    local function notifyProgress(progress)
-        for _, progressCallback in ipairs(self._progressCallbacks) do
-            pcall(progressCallback, progress, self._value)
-        end
-    end
-
-    -- Safely execute the provided executor function
-    local success, err = pcall(function()
+    local ok, err = safePcall(function()
         executor(resolve, reject, notifyProgress)
     end)
-    if not success then
+    if not ok then
         reject(err)
     end
 
     return self
 end
 
--- Creates a new Promise
 function Promise.new(executor)
     return createPromise(executor)
 end
 
--- Adds callbacks for when the promise is fulfilled or rejected
 function Promise:Then(onFulfilled, onRejected, onProgress)
-    -- If already resolved or rejected, handle it immediately
-    if self._status == "Fulfilled" and onFulfilled then
-        return Promise.Resolve(onFulfilled(self._value))
-    elseif self._status == "Rejected" and onRejected then
-        return Promise.Reject(onRejected(self._value))
-    end
-    
-    local newPromise = Promise.new(function(resolve, reject, notifyProgress)
-        local function callback()
-            if self._status == "Fulfilled" then
+    local parent = self
+    return Promise.new(function(resolve, reject, notifyProgress)
+        local function handle()
+            if parent._status == "Fulfilled" then
                 if onFulfilled then
-                    local success, result = pcall(onFulfilled, self._value)
-                    if success then
-                        resolve(result)
-                    else
-                        reject(result)
-                    end
+                    local ok, result = safePcall(onFulfilled, parent._value)
+                    if ok then resolve(result) else reject(result) end
                 else
-                    resolve(self._value)
+                    resolve(parent._value)
                 end
-            elseif self._status == "Rejected" then
+            elseif parent._status == "Rejected" or parent._status == "Cancelled" then
                 if onRejected then
-                    local success, result = pcall(onRejected, self._value)
-                    if success then
-                        resolve(result)
-                    else
-                        reject(result)
-                    end
+                    local ok, result = safePcall(onRejected, parent._value)
+                    if ok then resolve(result) else reject(result) end
                 else
-                    reject(self._value)
+                    reject(parent._value)
                 end
             end
         end
 
-        if self._status == "Pending" then
-            table.insert(self._callbacks, callback)
+        if parent._status == "Pending" then
+            table.insert(parent._callbacks, handle)
             if onProgress then
-                table.insert(self._progressCallbacks, onProgress)
+                table.insert(parent._progressCallbacks, onProgress)
             end
         else
-            callback()
+            asyncCall(handle)
         end
     end)
-
-    return newPromise
 end
 
--- Adds a callback for when the promise is rejected
 function Promise:Catch(onRejected)
     return self:Then(nil, onRejected)
 end
 
--- Returns a promise that rejects if the original promise does not settle within the specified time
-function Promise:Timeout(ms)
-    local timeoutPromise = Promise.new(function(_, reject)
-        delay(ms / 1000, function()
-            reject("Promise timed out")
-        end)
-    end)
-
-    return Promise.Race(self, timeoutPromise)
-end
-
--- Adds a progress callback to the promise
-function Promise:Progress(onProgress)
-    return self:Then(nil, nil, onProgress)
-end
-
--- Chains multiple promises together
-function Promise:Chain(...)
-    local promises = {...}
-    return self:Then(function()
-        local nextPromise = promises[1]
-        return nextPromise and nextPromise:Chain(table.unpack(promises, 2))
-    end)
-end
-
--- Executes a callback regardless of the promise's outcome
 function Promise:Finally(onFinally)
     return self:Then(
         function(value)
-            onFinally()
+            local ok, err = safePcall(onFinally)
+            if not ok then return Promise.Reject(err) end
             return value
         end,
         function(reason)
-            onFinally()
-            error(reason)
+            local ok, err = safePcall(onFinally)
+            if not ok then return Promise.Reject(err) end
+            return Promise.Reject(reason)
         end
     )
 end
 
--- Cancels the promise if a cancellation token is provided
+function Promise:Progress(onProgress)
+    return self:Then(nil, nil, onProgress)
+end
+
+function Promise:Timeout(ms)
+    local timeoutPromise = Promise.new(function(_, reject)
+        task.delay(ms / 1000, function()
+            reject("Promise timed out")
+        end)
+    end)
+    return Promise.Race(self, timeoutPromise)
+end
+
+function Promise:TimeoutWithFallback(ms, fallback)
+    return self:Timeout(ms):Catch(function()
+        return fallback
+    end)
+end
+
+function Promise:Delay(ms)
+    return self:Then(function(value)
+        return Promise.new(function(resolve)
+            task.delay(ms / 1000, function()
+                resolve(value)
+            end)
+        end)
+    end)
+end
+
 function Promise:Cancel()
     if self._status ~= "Pending" then return end
-    if self._cancellationToken then
-        self._cancellationToken()
-        self._status = "Cancelled"
+    self._status = "Cancelled"
+    self._value = "Promise cancelled"
+    for _, cb in ipairs(self._callbacks) do
+        safePcall(cb)
+    end
+    self._callbacks = {}
+    if self._cancellationCallback then
+        self._cancellationCallback()
     end
 end
 
--- Attaches a cancellation token to the promise
 function Promise:WithCancellation(token)
-    self._cancellationToken = token
+    self._cancellationCallback = token
     return self
 end
 
--- Resolves a promise with a given value
+function Promise:Status()
+    return self._status
+end
+
 function Promise.Resolve(value)
     return Promise.new(function(resolve)
         resolve(value)
     end)
 end
 
--- Rejects a promise with a given reason
 function Promise.Reject(reason)
     return Promise.new(function(_, reject)
         reject(reason)
     end)
 end
 
--- Returns a promise that resolves when all of the given promises resolve
 function Promise.All(...)
     local promises = {...}
     return Promise.new(function(resolve, reject)
-        local results = {}
-        local count = 0
-
-        for i, promise in ipairs(promises) do
-            promise:Then(function(result)
+        local results, count = {}, 0
+        for i, p in ipairs(promises) do
+            p:Then(function(result)
                 results[i] = result
-                count = count + 1
+                count += 1
                 if count == #promises then
                     resolve(results)
                 end
-            end):Catch(function(error)
-                reject(error)
+            end):Catch(function(err)
+                reject(err)
             end)
         end
     end)
 end
 
--- Returns a promise that resolves or rejects as soon as one of the given promises does
-function Promise.Race(...)
+function Promise.AllSettled(...)
     local promises = {...}
-    return Promise.new(function(resolve, reject)
-        for _, promise in ipairs(promises) do
-            promise:Then(resolve):Catch(reject)
+    return Promise.new(function(resolve)
+        local results, count = {}, 0
+        for i, p in ipairs(promises) do
+            p:Then(function(value)
+                results[i] = {status = "fulfilled", value = value}
+            end):Catch(function(reason)
+                results[i] = {status = "rejected", reason = reason}
+            end):Finally(function()
+                count += 1
+                if count == #promises then
+                    resolve(results)
+                end
+            end)
         end
     end)
 end
 
--- Returns a promise that resolves as soon as any one of the given promises resolves
+function Promise.Race(...)
+    local promises = {...}
+    return Promise.new(function(resolve, reject)
+        for _, p in ipairs(promises) do
+            p:Then(resolve):Catch(reject)
+        end
+    end)
+end
+
 function Promise.Any(...)
     local promises = {...}
     return Promise.new(function(resolve, reject)
-        local rejections = {}
-        local count = 0
-
-        for i, promise in ipairs(promises) do
-            promise:Then(resolve):Catch(function(reason)
+        local rejections, count = {}, 0
+        for i, p in ipairs(promises) do
+            p:Then(resolve):Catch(function(reason)
                 rejections[i] = reason
-                count = count + 1
+                count += 1
                 if count == #promises then
                     reject(rejections)
                 end
@@ -227,14 +263,47 @@ function Promise.Any(...)
     end)
 end
 
--- Delays the resolution of the promise
-function Promise:Delay(ms)
-    return self:Then(function(value)
-        return Promise.new(function(resolve)
-            delay(ms / 1000, function()
-                resolve(value)
-            end)
+function Promise.FromEvent(event, predicate)
+    return Promise.new(function(resolve)
+        local conn
+        conn = event:Connect(function(...)
+            if not predicate or predicate(...) then
+                conn:Disconnect()
+                resolve(...)
+            end
         end)
+    end)
+end
+
+function Promise.FromYield(fn, ...)
+    local args = table.pack(...)
+    return Promise.new(function(resolve, reject)
+        local ok, result = pcall(fn, table.unpack(args, 1, args.n))
+        if ok then resolve(result) else reject(result) end
+    end)
+end
+
+function Promise.Retry(fn, retries, delayMs)
+    retries = retries or 3
+    delayMs = delayMs or 0
+    return Promise.new(function(resolve, reject)
+        local function attempt(n)
+            local p = fn()
+            p:Then(resolve):Catch(function(err)
+                if n < retries then
+                    if delayMs > 0 then
+                        task.delay(delayMs / 1000, function()
+                            attempt(n + 1)
+                        end)
+                    else
+                        attempt(n + 1)
+                    end
+                else
+                    reject(err)
+                end
+            end)
+        end
+        attempt(1)
     end)
 end
 
